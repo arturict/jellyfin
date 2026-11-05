@@ -29,6 +29,13 @@ public class SkiaEncoder : IImageEncoder
     private const float SharpenCenterWeight = 1.4f;
     private const float SharpenNeighborWeight = -0.1f;
 
+    /// <summary>
+    /// Image pipeline selected with the JELLYFIN_IMAGE_BACKEND environment variable:
+    /// "skia" is the unmodified upstream path (full-size decode); anything else decodes
+    /// JPEG sources at a reduced DCT scale before resizing (see <see cref="TryDecodeScaled"/>).
+    /// </summary>
+    private static readonly string _imageBackend = Environment.GetEnvironmentVariable("JELLYFIN_IMAGE_BACKEND")?.Trim().ToLowerInvariant() ?? string.Empty;
+
     private static readonly HashSet<string> _transparentImageTypes = new(StringComparer.OrdinalIgnoreCase) { ".png", ".gif", ".webp" };
     private readonly ILogger<SkiaEncoder> _logger;
     private readonly IApplicationPaths _appPaths;
@@ -554,11 +561,22 @@ public class SkiaEncoder : IImageEncoder
     /// <param name="isAntialias">This enables anti-aliasing on the SKPaint instance.</param>
     /// <param name="isDither">This enables dithering on the SKPaint instance.</param>
     /// <returns>The resized image.</returns>
-    internal static SKImage ResizeImage(SKBitmap source, SKImageInfo targetInfo, bool isAntialias = false, bool isDither = false)
+    /// <param name="sharpen">Whether to sharpen; defaults to "is this a downscale". A caller that decoded a
+    /// reduced-scale bitmap passes whether the original image is larger than the target.</param>
+    internal static SKImage ResizeImage(SKBitmap source, SKImageInfo targetInfo, bool isAntialias = false, bool isDither = false, bool? sharpen = null)
     {
         if (source.Width == targetInfo.Width && source.Height == targetInfo.Height)
         {
-            return SKImage.FromBitmap(source);
+            if (sharpen != true)
+            {
+                return SKImage.FromBitmap(source);
+            }
+
+            // A scaled decode can land exactly on the target size; the full-size path would
+            // still have downscaled and sharpened, so sharpen a copy to keep the output alike.
+            using var copy = source.Copy();
+            SharpenInPlace(copy);
+            return SKImage.FromBitmap(copy);
         }
 
         var isDownscale = source.Width > targetInfo.Width || source.Height > targetInfo.Height;
@@ -583,7 +601,7 @@ public class SkiaEncoder : IImageEncoder
             samplingOptions,
             paint);
 
-        if (isDownscale)
+        if (sharpen ?? isDownscale)
         {
             SharpenInPlace(target);
         }
@@ -683,16 +701,25 @@ public class SkiaEncoder : IImageEncoder
         var blur = options.Blur ?? 0;
         var hasIndicator = options.UnplayedCount.HasValue || !options.PercentPlayed.Equals(0);
 
-        using var bitmap = inputFormat.Equals(SvgFormat, StringComparison.OrdinalIgnoreCase)
-            ? GetBitmapFromSvg(inputPath)
-            : GetBitmap(inputPath, autoOrient, orientation);
-
-        if (bitmap is null)
+        SKBitmap? decoded;
+        ImageDimensions? headerSize = null;
+        if (inputFormat.Equals(SvgFormat, StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidDataException($"Skia unable to read image {inputPath}");
+            decoded = GetBitmapFromSvg(inputPath);
+        }
+        else if (TryDecodeScaled(inputPath, autoOrient, options, out var scaled, out var originalSize))
+        {
+            decoded = scaled;
+            headerSize = originalSize;
+        }
+        else
+        {
+            decoded = GetBitmap(inputPath, autoOrient, orientation);
         }
 
-        var originalImageSize = new ImageDimensions(bitmap.Width, bitmap.Height);
+        using var bitmap = decoded ?? throw new InvalidDataException($"Skia unable to read image {inputPath}");
+
+        var originalImageSize = headerSize ?? new ImageDimensions(bitmap.Width, bitmap.Height);
 
         if (options.HasDefaultOptions(inputPath, originalImageSize) && !autoOrient)
         {
@@ -707,7 +734,8 @@ public class SkiaEncoder : IImageEncoder
 
         // scale image (the FromImage creates a copy)
         var imageInfo = new SKImageInfo(width, height, bitmap.ColorType, bitmap.AlphaType, bitmap.ColorSpace);
-        using var resizedImage = ResizeImage(bitmap, imageInfo);
+        var isDownscaleOfOriginal = originalImageSize.Width > width || originalImageSize.Height > height;
+        using var resizedImage = ResizeImage(bitmap, imageInfo, sharpen: isDownscaleOfOriginal);
         using var resizedBitmap = SKBitmap.FromImage(resizedImage);
 
         // If all we're doing is resizing then we can stop now
@@ -763,6 +791,73 @@ public class SkiaEncoder : IImageEncoder
         }
 
         return outputPath;
+    }
+
+    /// <summary>
+    /// Decodes a JPEG at the smallest DCT scale (1/8 steps) that is still at least the target
+    /// size. The entropy decoding still reads the whole file, but the inverse DCT, colour
+    /// conversion and the later resize work on far fewer pixels: a 2000x3000 poster requested
+    /// at 300 px is decoded at 500x750 instead of 6 megapixels.
+    /// </summary>
+    /// <returns><c>false</c> when the caller should take the full-size path.</returns>
+    private bool TryDecodeScaled(string path, bool autoOrient, ImageProcessingOptions options, out SKBitmap? bitmap, out ImageDimensions originalSize)
+    {
+        bitmap = null;
+        originalSize = default;
+        if (autoOrient || _imageBackend == "skia")
+        {
+            return false;
+        }
+
+        var extension = Path.GetExtension(path.AsSpan());
+        if (!extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        using var codec = SKCodec.Create(NormalizePath(path), out var result);
+        if (codec is null || result != SKCodecResult.Success || codec.Info.ColorType == SKColorType.Gray8)
+        {
+            return false;
+        }
+
+        originalSize = new ImageDimensions(codec.Info.Width, codec.Info.Height);
+        if (options.HasDefaultOptions(path, originalSize))
+        {
+            return false;
+        }
+
+        var target = ImageHelper.GetNewImageSize(options, originalSize);
+        if (target.Width <= 0 || target.Height <= 0 || target.Width >= originalSize.Width || target.Height >= originalSize.Height)
+        {
+            return false;
+        }
+
+        // libjpeg-turbo scales in steps of 1/8 and Skia rounds a requested scale down to the
+        // next step, so ask for the next step up to stay at or above the target size.
+        var scale = Math.Max((float)target.Width / originalSize.Width, (float)target.Height / originalSize.Height);
+        var scaledSize = codec.GetScaledDimensions(MathF.Ceiling(scale * 8) / 8);
+        if (scaledSize.Width < target.Width || scaledSize.Height < target.Height
+            || (scaledSize.Width == originalSize.Width && scaledSize.Height == originalSize.Height))
+        {
+            return false;
+        }
+
+        // Same pixel layout SKBitmap.Decode(path) produces for a JPEG: the codec's colour type,
+        // premultiplied alpha and no colour space attached.
+        var info = codec.Info.WithSize(scaledSize.Width, scaledSize.Height);
+        info.AlphaType = info.AlphaType == SKAlphaType.Unpremul ? SKAlphaType.Premul : info.AlphaType;
+        info.ColorSpace = null;
+        var scaled = new SKBitmap(info);
+        if (codec.GetPixels(info, scaled.GetPixels()) != SKCodecResult.Success)
+        {
+            scaled.Dispose();
+            return false;
+        }
+
+        bitmap = scaled;
+        return true;
     }
 
     /// <inheritdoc/>
